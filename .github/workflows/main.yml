@@ -10,9 +10,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
         abi: [arm64-v8a, armeabi-v7a]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,19 +24,30 @@ jobs:
         with:
           ndk-version: r25b
 
+      - name: Verify files
+        run: |
+          pwd
+          ls -la
+          find . -name CMakeLists.txt
+
       - name: Configure CMake
         run: |
-          cmake -B build \
+          cmake -S . -B build \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=android-21 \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: |
+          cmake --build build --parallel
+
+      - name: List outputs
+        run: |
+          find build -name "*.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: stealth_fix-${{ matrix.abi }}
-          path: build/libs/${{ matrix.abi }}/libstealth_fix.so
+          path: build/libstealth_fix.so
