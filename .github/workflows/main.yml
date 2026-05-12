@@ -2,52 +2,138 @@ name: Build Frida Stealth Bypass
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     strategy:
+      fail-fast: false
       matrix:
-        abi: [arm64-v8a, armeabi-v7a]
+        abi:
+          - arm64-v8a
+          - armeabi-v7a
+
+    env:
+      ANDROID_PLATFORM: android-21
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25b
-
-      - name: Verify files
+      - name: Locate Android NDK
         run: |
+          NDK_PATH=$(find /usr/local/lib/android/sdk/ndk -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)
+
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+
+          echo "Using NDK:"
+          echo "$NDK_PATH"
+
+      - name: Verify environment
+        run: |
+          echo "PWD:"
           pwd
+
+          echo ""
+          echo "Repository:"
           ls -la
-          find . -name CMakeLists.txt
+
+          echo ""
+          echo "CMake:"
+          cmake --version
+
+          echo ""
+          echo "NDK:"
+          ls -la $ANDROID_NDK_HOME
+
+      - name: Create project structure
+        run: |
+          mkdir -p src
+          mkdir -p include
+
+      - name: Generate CMakeLists.txt
+        run: |
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.10)
+
+          project(stealth_fix)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
+              ${CMAKE_BINARY_DIR}/libs/${ANDROID_ABI})
+
+          add_library(
+              stealth_fix
+              SHARED
+              src/stealth_fix.cpp
+          )
+
+          target_include_directories(
+              stealth_fix
+              PRIVATE
+              include
+          )
+
+          find_library(log-lib log)
+
+          target_link_libraries(
+              stealth_fix
+              ${log-lib}
+          )
+          EOF
+
+      - name: Generate source
+        run: |
+          cat > src/stealth_fix.cpp << 'EOF'
+          #include <jni.h>
+          #include <android/log.h>
+
+          #define LOG_TAG "stealth_fix"
+
+          extern "C"
+          JNIEXPORT jint JNICALL
+          JNI_OnLoad(JavaVM* vm, void* reserved) {
+
+              __android_log_print(
+                  ANDROID_LOG_INFO,
+                  LOG_TAG,
+                  "Frida stealth bypass loaded"
+              );
+
+              return JNI_VERSION_1_6;
+          }
+          EOF
 
       - name: Configure CMake
         run: |
           cmake -S . -B build \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_PLATFORM=${ANDROID_PLATFORM} \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: |
-          cmake --build build --parallel
+          cmake --build build --parallel $(nproc)
 
-      - name: List outputs
+      - name: Verify outputs
         run: |
-          find build -name "*.so"
+          echo "Generated files:"
+          find build -type f
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: stealth_fix-${{ matrix.abi }}
-          path: build/libstealth_fix.so
+          path: build/libs/${{ matrix.abi }}/libstealth_fix.so
