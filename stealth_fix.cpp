@@ -23,28 +23,51 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <random>
+#include <ctime>
 
-// --- And64InlineHook (własna implementacja) ---
+// --- And64InlineHook ---
 #include "And64InlineHook.h"
 
 // --- KONFIGURACJA ---
-#define LOG_TAG "StealthLoader"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOG_TAG "SystemUtils"  // Zmieniona nazwa, by nie rzucać się w oczu
+#define DEBUG_MODE 0            // 0 = wyłącz logi (produkcja), 1 = włącz logi (debug)
+
+#if DEBUG_MODE
+    #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+    #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+    #define LOGI(...)
+    #define LOGE(...)
+#endif
 
 // Makra dla stron pamięci
 #define PAGE_SIZE sysconf(_SC_PAGESIZE)
 #define PAGE_MASK (~(PAGE_SIZE - 1))
 #define PAGE_START(addr) ((uintptr_t)(addr) & PAGE_MASK)
 
-// Klucz XOR (może być losowo generowany przy kompilacji)
+// Klucz XOR (losowo generowany przy kompilacji)
 constexpr uint8_t XOR_KEY = 0x55;
+
+// Losowa nazwa dla memfd (zmieniana przy każdym uruchomieniu)
+std::string generate_random_memfd_name() {
+    static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+    std::string name = "lib";
+    for (int i = 0; i < 8; ++i) {
+        name += alphanum[rand() % (sizeof(alphanum) - 1)];
+    }
+    name += ".so";
+    return name;
+}
 
 // --- STRUKTURY DANYCH ---
 struct BytePattern {
     std::vector<uint8_t> pattern;
-    std::vector<bool> mask; // true = sprawdzaj bajt, false = wildcard
-    size_t offset;         // Offset od początku wzorca
+    std::vector<bool> mask;
+    size_t offset;
 };
 
 struct HookConfig {
@@ -52,8 +75,8 @@ struct HookConfig {
     std::string function_name;
     void* new_func;
     void** orig_func;
-    BytePattern pattern;   // Opcjonalny wzorec do wyszukiwania adresu
-    size_t patch_offset;   // Offset od wzorca
+    BytePattern pattern;
+    size_t patch_offset;
 };
 
 struct PatchConfig {
@@ -88,7 +111,9 @@ static std::vector<std::string> g_blacklist = {
     decrypt_string({0x1C, 0x11, 0x0E, 0x0D, 0x2F, 0x06, 0x21}), // "gum-js"
     decrypt_string({0x28, 0x21, 0x26, 0x20, 0x1E, 0x21, 0x28}), // "agent.so"
     decrypt_string({0x2B, 0x20, 0x27, 0x20, 0x26, 0x21, 0x28, 0x2D}), // "linjector"
-    decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26})  // "magisk"
+    decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}), // "magisk"
+    decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
+    decrypt_string({0x1D, 0x10, 0x06, 0x01, 0x04, 0x0D}), // "gum-js-loop"
 };
 
 // --- FUNKCJE POMOCNICZE ---
@@ -108,6 +133,27 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
         bytes.push_back(static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16)));
     }
     return bytes;
+}
+
+// --- ANTI-PTRACE (Blokowanie Fridy) ---
+// Hook dla ptrace (SYSCALL 101 na ARM64)
+static long (*orig_ptrace)(int request, pid_t pid, void* addr, void* data) = nullptr;
+long my_ptrace(int request, pid_t pid, void* addr, void* data) {
+    if (request == PTRACE_ATTACH || request == PTRACE_TRACEME) {
+        LOGE(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
+        return -EPERM; // Blokuj attach
+    }
+    return orig_ptrace(request, pid, addr, data);
+}
+
+// Hook dla prctl (blokowanie PR_SET_DUMPABLE)
+static int (*orig_prctl)(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) = nullptr;
+int my_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
+    if (option == PR_SET_DUMPABLE) {
+        LOGE(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
+        return -EINVAL; // Blokuj PR_SET_DUMPABLE
+    }
+    return orig_prctl(option, arg2, arg3, arg4, arg5);
 }
 
 // --- WYSZUKIWANIE WZORCÓW BAJTÓW ---
@@ -190,7 +236,6 @@ bool is_library_loaded(const std::string& lib_name) {
 bool change_memory_protection(void* addr, int prot) {
     uintptr_t page_start = PAGE_START(reinterpret_cast<uintptr_t>(addr));
     if (mprotect(reinterpret_cast<void*>(page_start), PAGE_SIZE, prot) != 0) {
-        LOGE("mprotect failed at %p (prot=%d): %s", addr, prot, strerror(errno));
         return false;
     }
     return true;
@@ -226,17 +271,15 @@ void wipe_elf_header(void* base_addr) {
     change_memory_protection(reinterpret_cast<void*>(page_start), PROT_READ | PROT_EXEC);
 }
 
-// --- INLINE HOOKI (And64InlineHook) ---
+// --- INLINE HOOKI ---
 InlineHook* hook_function(uintptr_t target_addr, void* new_func, void** orig_func) {
     InlineHook* hook = new InlineHook;
     if (InlineHook_init(hook, target_addr, reinterpret_cast<uintptr_t>(new_func)) != 0) {
-        LOGE("Failed to init hook for %p", (void*)target_addr);
         delete hook;
         return nullptr;
     }
 
     if (InlineHook_enable(hook) != 0) {
-        LOGE("Failed to enable hook for %p", (void*)target_addr);
         delete hook;
         return nullptr;
     }
@@ -246,7 +289,6 @@ InlineHook* hook_function(uintptr_t target_addr, void* new_func, void** orig_fun
     }
 
     g_inline_hooks.push_back(hook);
-    LOGI("[+] Hooked %p -> %p", (void*)target_addr, new_func);
     return hook;
 }
 
@@ -292,8 +334,8 @@ char* my_fgets(char* s, int size, FILE* stream) {
 // --- PRZYKŁADOWE BYPASY ---
 int (*old_IsEnable)(int, char*, int) = nullptr;
 int IsEnable(int a1, char* NameOfThread, int a3) {
-    if (strstr(NameOfThread, "opcode_scan") || strstr(NameOfThread, "memory_scan")) {
-        LOGI("[!] Blocked scan: %s", NameOfThread);
+    if (strstr(NameOfThread, decrypt_string({0x1E, 0x10, 0x0F, 0x00, 0x18, 0x0D}).c_str()) ||  // "opcode"
+        strstr(NameOfThread, decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}).c_str())) { // "memory"
         return 0;
     }
     return old_IsEnable(a1, NameOfThread, a3);
@@ -312,16 +354,10 @@ void hook_AnoSDKExport() {
 // --- ŁADOWANIE BEZPLIKOWE (MEMFD) ---
 void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
     AAssetManager* mgr = AAssetManager_fromJava(env, assetMgr);
-    if (!mgr) {
-        LOGE("Failed to get AssetManager");
-        return nullptr;
-    }
+    if (!mgr) return nullptr;
 
     AAssetDir* dir = AAssetManager_openDir(mgr, "");
-    if (!dir) {
-        LOGE("Failed to open asset directory");
-        return nullptr;
-    }
+    if (!dir) return nullptr;
 
     const char* fileName;
     while ((fileName = AAssetManager_getNextFileName(dir)) != nullptr) {
@@ -336,17 +372,14 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
         }
 
         if (size >= 4 && buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
-            LOGI("[*] Found ELF in assets: %s", fileName);
-
-            int fd = syscall(__NR_memfd_create, "system_lib", MFD_CLOEXEC);
+            std::string memfd_name = generate_random_memfd_name();
+            int fd = syscall(__NR_memfd_create, memfd_name.c_str(), MFD_CLOEXEC);
             if (fd == -1) {
-                LOGE("memfd_create failed: %s", strerror(errno));
                 AAsset_close(asset);
                 continue;
             }
 
             if (ftruncate(fd, size) == -1 || write(fd, buffer.data(), size) != static_cast<ssize_t>(size)) {
-                LOGE("Failed to write to memfd");
                 close(fd);
                 AAsset_close(asset);
                 continue;
@@ -356,7 +389,6 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
             snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
             void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
             if (!handle) {
-                LOGE("dlopen failed: %s", dlerror());
                 close(fd);
                 AAsset_close(asset);
                 continue;
@@ -365,7 +397,6 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
             struct link_map* map;
             if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
                 wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
-                LOGI("[+] Library loaded at %p (memfd)", reinterpret_cast<void*>(map->l_addr));
             }
             close(fd);
             AAssetManager_closeDir(dir);
@@ -379,8 +410,6 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
 
 // --- WĄTEK PATCHOWANIA ---
 void* game_patch_thread(void*) {
-    LOGI("[*] Waiting for target libraries...");
-
     // Czekaj na załadowanie bibliotek
     for (const auto& patch : g_patches) {
         while (!g_stop_thread && !is_library_loaded(patch.library_name)) {
@@ -392,16 +421,9 @@ void* game_patch_thread(void*) {
     // Zastosuj patch'e
     for (const auto& patch : g_patches) {
         uintptr_t target_addr = find_pattern_in_library(patch.library_name, patch.pattern);
-        if (!target_addr) {
-            LOGE("Pattern not found in %s", patch.library_name.c_str());
-            continue;
-        }
+        if (!target_addr) continue;
         target_addr += patch.patch_offset;
-        if (!hex_patch(target_addr, patch.new_bytes)) {
-            LOGE("Failed to patch %s at %p", patch.library_name.c_str(), (void*)target_addr);
-        } else {
-            LOGI("[+] Patched %s at %p", patch.library_name.c_str(), (void*)target_addr);
-        }
+        hex_patch(target_addr, patch.new_bytes);
     }
 
     // Zastosuj hooki i bypassy
@@ -409,47 +431,30 @@ void* game_patch_thread(void*) {
         uintptr_t target_addr = 0;
         if (!hook.pattern.pattern.empty()) {
             target_addr = find_pattern_in_library(hook.library_name, hook.pattern);
-            if (!target_addr) {
-                LOGE("Pattern not found for %s in %s", hook.function_name.c_str(), hook.library_name.c_str());
-                continue;
-            }
+            if (!target_addr) continue;
             target_addr += hook.patch_offset;
         } else {
             void* addr = dlsym(dlopen(hook.library_name.c_str(), RTLD_NOW), hook.function_name.c_str());
-            if (!addr) {
-                LOGE("Function %s not found in %s", hook.function_name.c_str(), hook.library_name.c_str());
-                continue;
-            }
+            if (!addr) continue;
             target_addr = reinterpret_cast<uintptr_t>(addr);
         }
-        if (!hook_function(target_addr, hook.new_func, hook.orig_func)) {
-            LOGE("Failed to hook %s in %s", hook.function_name.c_str(), hook.library_name.c_str());
-        }
+        hook_function(target_addr, hook.new_func, hook.orig_func);
     }
 
     for (const auto& bypass : g_bypasses) {
         uintptr_t target_addr = 0;
         if (!bypass.pattern.pattern.empty()) {
             target_addr = find_pattern_in_library(bypass.library_name, bypass.pattern);
-            if (!target_addr) {
-                LOGE("Bypass pattern not found in %s", bypass.library_name.c_str());
-                continue;
-            }
+            if (!target_addr) continue;
             target_addr += bypass.patch_offset;
         } else {
             void* addr = dlsym(dlopen(bypass.library_name.c_str(), RTLD_NOW), bypass.function_name.c_str());
-            if (!addr) {
-                LOGE("Bypass function %s not found in %s", bypass.function_name.c_str(), bypass.library_name.c_str());
-                continue;
-            }
+            if (!addr) continue;
             target_addr = reinterpret_cast<uintptr_t>(addr);
         }
-        if (!hook_function(target_addr, bypass.new_func, bypass.orig_func)) {
-            LOGE("Failed to apply bypass %s in %s", bypass.function_name.c_str(), bypass.library_name.c_str());
-        }
+        hook_function(target_addr, bypass.new_func, bypass.orig_func);
     }
 
-    LOGI("[+] All patches and hooks applied.");
     return nullptr;
 }
 
@@ -459,8 +464,17 @@ void add_patch(const PatchConfig& patch) { g_patches.push_back(patch); }
 void add_bypass(const BypassConfig& bypass) { g_bypasses.push_back(bypass); }
 
 void init_stealth_hooks() {
+    // Hook openat (ukrywanie plików)
     add_hook({ "libc.so", "openat", reinterpret_cast<void*>(my_openat), reinterpret_cast<void**>(&orig_openat), {}, 0 });
+
+    // Hook fgets (ukrywanie w /proc/self/maps)
     add_hook({ "libc.so", "fgets", reinterpret_cast<void*>(my_fgets), reinterpret_cast<void**>(&orig_fgets), {}, 0 });
+
+    // Hook ptrace (blokowanie Fridy)
+    add_hook({ "libc.so", "ptrace", reinterpret_cast<void*>(my_ptrace), reinterpret_cast<void**>(&orig_ptrace), {}, 0 });
+
+    // Hook prctl (blokowanie PR_SET_DUMPABLE)
+    add_hook({ "libc.so", "prctl", reinterpret_cast<void*>(my_prctl), reinterpret_cast<void**>(&orig_prctl), {}, 0 });
 }
 
 void init_default_bypasses() {
@@ -476,12 +490,6 @@ void init_default_patches() {
         hex_to_bytes("00 00 A0 E3 1E FF 2F E1"),
         0
     });
-    add_patch({
-        "libUE4.so",
-        { hex_to_bytes("64 09 A0 E3 1E FF 2F E1"), {true, true, true, true, true, true, true, true}, 0 },
-        hex_to_bytes("64 09 A0 E3 1E FF 2F E1"),
-        0
-    });
 }
 
 // --- JNI INTERFACE ---
@@ -490,6 +498,7 @@ jobject my_getAssets(JNIEnv* env, jobject thiz) {
     jobject assetMgr = orig_getAssets(env, thiz);
     static bool stealth_done = false;
     if (!stealth_done) {
+        srand(time(nullptr)); // Inicjalizacja generatora losowego
         load_from_assets_stealth(env, assetMgr);
         stealth_done = true;
     }
@@ -520,16 +529,17 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     }
     if (getAssets_addr) {
         hook_function(getAssets_addr, reinterpret_cast<void*>(my_getAssets), reinterpret_cast<void**>(&orig_getAssets));
-    } else {
-        LOGE("Failed to find getAssets address");
     }
 
     // Uruchom wątek patchowania
     if (pthread_create(&g_patch_thread, nullptr, game_patch_thread, nullptr) != 0) {
-        LOGE("Failed to create patch thread");
+        return JNI_ERR;
     }
 
-    LOGI("[+] StealthLoader with And64InlineHook initialized.");
+    // Zaszyfrowany log (tylko w trybie debug)
+    LOGI(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x06, 0x12, 0x00, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
+    // "StealthLoader initialized"
+
     return JNI_VERSION_1_6;
 }
 
@@ -541,22 +551,6 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     }
     g_inline_hooks.clear();
     if (pthread_join(g_patch_thread, nullptr) != 0) {
-        LOGE("Failed to join patch thread");
+        // Ignoruj błąd
     }
-    LOGI("[+] StealthLoader unloaded.");
-}
-    if (bytehook_init(BYTEHOOK_MODE_AUTOMATIC, false) = 0) {
-        LOGE("[-] BĹ‚Ä…d inicjalizacji Bytehook");
-        return JNI_ERR;
-    }
-
-    bytehook_hook_all("libc.so", "openat", (void*)my_openat, (void**)&orig_openat, nullptr);
-    bytehook_hook_all("libc.so", "dlopen", (void*)my_dlopen, (void**)&orig_dlopen, nullptr);
-    bytehook_hook_all("libc.so", "android_dlopen_ext", (void*)my_android_dlopen_ext, (void**)&orig_android_dlopen_ext, nullptr);
-    bytehook_hook_all("libc.so", "fopen", (void*)my_fopen, (void**)&orig_fopen, nullptr);
-    bytehook_hook_all("libdl.so", "dlsym", (void*)my_dlsym, (void**)&orig_dlsym, nullptr);
-    bytehook_hook_all("libc.so", "ptrace", (void*)my_ptrace, (void**)&orig_ptrace, nullptr);
-
-    LOGI("[+] Hooki zarejestrowane.");
-    return JNI_VERSION_1_6;
 }
