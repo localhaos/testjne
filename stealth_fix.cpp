@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <random>
 #include <ctime>
+#include <inttypes.h>  // For SCNxPTR
+#include <sys/prctl.h> // For PR_SET_DUMPABLE
 
 #if __has_include(<sys/ashmem.h>)
 #include <sys/ashmem.h>
@@ -55,26 +57,7 @@
 // XOR key for string obfuscation
 constexpr uint8_t XOR_KEY = 0x55;
 
-// --- GLOBALS ---
-static JavaVM* g_jvm = nullptr;
-static pthread_t g_patch_thread;
-static volatile bool g_stop_thread = false;
-static std::mutex g_memory_mutex;
-static std::map<std::string, uintptr_t> g_library_bases;
-static std::vector<InlineHook*> g_inline_hooks;
-static bool g_frida_loaded = false;
-
-// Blacklist (Frida is NOT included to allow it to work)
-static std::vector<std::string> g_blacklist = {
-    decrypt_string({0x1B, 0x10, 0x07, 0x04, 0x00, 0x1E, 0x07}), // "gadget"
-    decrypt_string({0x1C, 0x11, 0x0E, 0x0D, 0x2F, 0x06, 0x21}), // "gum-js"
-    decrypt_string({0x28, 0x21, 0x26, 0x20, 0x1E, 0x21, 0x28}), // "agent.so"
-    decrypt_string({0x2B, 0x20, 0x27, 0x20, 0x26, 0x21, 0x28, 0x2D}), // "linjector"
-    decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}), // "magisk"
-    decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
-};
-
-// --- INLINE HOOK STRUCT ---
+// --- INLINE HOOK STRUCT (MUST BE DEFINED BEFORE USE) ---
 typedef struct {
     uintptr_t targetAddr;
     uintptr_t replaceAddr;
@@ -82,7 +65,7 @@ typedef struct {
     int enabled;
 } InlineHook;
 
-// --- HELPER FUNCTIONS ---
+// --- HELPER FUNCTIONS (MUST BE DEFINED BEFORE USE IN GLOBALS) ---
 std::string decrypt_string(const std::vector<uint8_t>& cipher) {
     std::string output;
     for (uint8_t b : cipher) {
@@ -113,6 +96,25 @@ std::string generate_random_name() {
     name += ".so";
     return name;
 }
+
+// --- GLOBALS (NOW AFTER DECLARATIONS) ---
+static JavaVM* g_jvm = nullptr;
+static pthread_t g_patch_thread;
+static volatile bool g_stop_thread = false;
+static std::mutex g_memory_mutex;
+static std::map<std::string, uintptr_t> g_library_bases;
+static std::vector<InlineHook*> g_inline_hooks;
+static bool g_frida_loaded = false;
+
+// Blacklist (Frida is NOT included to allow it to work)
+static std::vector<std::string> g_blacklist = {
+    decrypt_string({0x1B, 0x10, 0x07, 0x04, 0x00, 0x1E, 0x07}), // "gadget"
+    decrypt_string({0x1C, 0x11, 0x0E, 0x0D, 0x2F, 0x06, 0x21}), // "gum-js"
+    decrypt_string({0x28, 0x21, 0x26, 0x20, 0x1E, 0x21, 0x28}), // "agent.so"
+    decrypt_string({0x2B, 0x20, 0x27, 0x20, 0x26, 0x21, 0x28, 0x2D}), // "linjector"
+    decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}), // "magisk"
+    decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
+};
 
 // --- MEMORY UTILITIES ---
 uintptr_t find_library_base(const char* lib_name) {
@@ -255,7 +257,6 @@ void unhook_function(InlineHook* hook) {
 }
 
 // --- ANTI-DETECTION HOOKS ---
-// Allow PTRACE_TRACEME for Frida, but block other ptrace requests
 static long (*orig_syscall)(long number, ...) = nullptr;
 long my_syscall(long number, ...) {
     if (number == __NR_ptrace) {
@@ -264,9 +265,9 @@ long my_syscall(long number, ...) {
         long request = va_arg(args, long);
         va_end(args);
         if (request == PTRACE_TRACEME) {
-            return orig_syscall(number, args); // Allow Frida to attach
+            return orig_syscall(number, args);
         }
-        return -EPERM; // Block other ptrace requests
+        return -EPERM;
     }
     va_list args;
     va_start(args, number);
@@ -275,7 +276,6 @@ long my_syscall(long number, ...) {
     return result;
 }
 
-// Block PR_SET_DUMPABLE
 static int (*orig_prctl)(int option, ...) = nullptr;
 int my_prctl(int option, ...) {
     if (option == PR_SET_DUMPABLE) {
@@ -288,7 +288,6 @@ int my_prctl(int option, ...) {
     return result;
 }
 
-// Block blacklisted files (but NOT frida-gadget)
 bool contains_blacklist(const char* str) {
     if (!str) return false;
     for (const auto& keyword : g_blacklist) {
@@ -308,7 +307,6 @@ int my_openat(int dirfd, const char* pathname, int flags, mode_t mode) {
     return orig_openat(dirfd, pathname, flags, mode);
 }
 
-// Block blacklisted strings in fgets
 static char* (*orig_fgets)(char*, int, FILE*) = nullptr;
 char* my_fgets(char* s, int size, FILE* stream) {
     char* result = orig_fgets(s, size, stream);
@@ -318,7 +316,6 @@ char* my_fgets(char* s, int size, FILE* stream) {
     return result;
 }
 
-// Fake /proc/self/status (hide TracerPid)
 static ssize_t (*orig_readlink)(const char*, char*, size_t) = nullptr;
 ssize_t my_readlink(const char* pathname, char* buf, size_t bufsiz) {
     if (strstr(pathname, "/proc/self/status")) {
@@ -336,7 +333,6 @@ ssize_t my_readlink(const char* pathname, char* buf, size_t bufsiz) {
     return orig_readlink(pathname, buf, bufsiz);
 }
 
-// Block tombstone (crash reports)
 static int (*orig_sigaction)(int, const struct sigaction*, struct sigaction*) = nullptr;
 int my_sigaction(int signum, const struct sigaction* act, struct sigaction* oldact) {
     if (signum == SIGSEGV || signum == SIGBUS || signum == SIGABRT) {
@@ -347,12 +343,11 @@ int my_sigaction(int signum, const struct sigaction* act, struct sigaction* olda
     return orig_sigaction(signum, act, oldact);
 }
 
-// --- FRIDA GADGET LOADING (Hidden) ---
+// --- FRIDA GADGET LOADING ---
 void load_frida_gadget() {
     if (g_frida_loaded) return;
     g_frida_loaded = true;
 
-    // Try to load from /data/local/tmp/libcustom.so (renamed frida-gadget)
     const char* frida_path = "/data/local/tmp/libcustom.so";
     int fd = open(frida_path, O_RDONLY);
     if (fd == -1) {
@@ -382,7 +377,6 @@ void load_frida_gadget() {
         return;
     }
 
-    // Wipe ELF header to hide from scanners
     struct link_map* map;
     if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
         wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
@@ -393,7 +387,7 @@ void load_frida_gadget() {
     LOGI("Frida gadget loaded successfully!");
 }
 
-// --- ASSET LOADING (Stealth) ---
+// --- ASSET LOADING ---
 void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
     AAssetManager* mgr = AAssetManager_fromJava(env, assetMgr);
     if (!mgr) return nullptr;
@@ -505,7 +499,7 @@ jobject my_getAssets(JNIEnv* env, jobject thiz) {
     return assetMgr;
 }
 
-// --- JNI_ONLOAD (FIXED INIT) ---
+// --- JNI_ONLOAD ---
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_jvm = vm;
     JNIEnv* env;
@@ -513,10 +507,10 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    // Load Frida Gadget (hidden)
+    // Load Frida Gadget
     load_frida_gadget();
 
-    // Initialize stealth hooks
+    // Initialize hooks
     void* syscall_addr = dlsym(RTLD_DEFAULT, "syscall");
     if (syscall_addr) {
         hook_function(reinterpret_cast<uintptr_t>(syscall_addr),
@@ -559,7 +553,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                      reinterpret_cast<void**>(&orig_sigaction));
     }
 
-    // Hook getAssets to load stealth libraries
+    // Hook getAssets
     uintptr_t getAssets_addr = reinterpret_cast<uintptr_t>(
         dlsym(RTLD_DEFAULT, "_ZN7android14AssetManager10getAssetsEv")
     );
