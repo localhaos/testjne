@@ -54,7 +54,6 @@
 #define PAGE_MASK (~(PAGE_SIZE - 1))
 #define PAGE_START(addr) ((uintptr_t)(addr) & PAGE_MASK)
 
-// XOR key for string obfuscation
 constexpr uint8_t XOR_KEY = 0x55;
 
 // --- INLINE HOOK STRUCT ---
@@ -86,17 +85,6 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
     return bytes;
 }
 
-std::string generate_random_name() {
-    static const char alphanum[] =
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    std::string name = "lib";
-    for (int i = 0; i < 8; ++i) {
-        name += alphanum[rand() % (sizeof(alphanum) - 1)];
-    }
-    name += ".so";
-    return name;
-}
-
 // --- GLOBALS ---
 static JavaVM* g_jvm = nullptr;
 static pthread_t g_patch_thread;
@@ -107,7 +95,6 @@ static std::vector<InlineHook*> g_inline_hooks;
 static bool g_frida_loaded = false;
 static std::string g_lib_dir; // Katalog z bibliotekami (lib/arm64-v8a/)
 
-// Blacklist (Frida is NOT included to allow it to work)
 static std::vector<std::string> g_blacklist = {
     decrypt_string({0x1B, 0x10, 0x07, 0x04, 0x00, 0x1E, 0x07}), // "gadget"
     decrypt_string({0x1C, 0x11, 0x0E, 0x0D, 0x2F, 0x06, 0x21}), // "gum-js"
@@ -117,13 +104,12 @@ static std::vector<std::string> g_blacklist = {
     decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
 };
 
-// --- GET LIBRARY DIRECTORY (Dla ładowania z lib/arm64-v8a/) ---
+// --- GET LIBRARY DIRECTORY (Pobiera ścieżkę do lib/arm64-v8a/) ---
 std::string get_library_dir() {
     if (!g_lib_dir.empty()) {
         return g_lib_dir;
     }
 
-    // Szukaj ścieżki do stealth_fix.so w /proc/self/maps
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) {
         LOGE("Failed to open /proc/self/maps");
@@ -133,12 +119,11 @@ std::string get_library_dir() {
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "stealth_fix.so")) {
-            // Wyodrębnij ścieżkę do katalogu
             char* path_start = strchr(line, '/');
             if (path_start) {
                 char* path_end = strrchr(path_start, '/');
                 if (path_end) {
-                    *path_end = '\0'; // Obetnij nazwę pliku
+                    *path_end = '\0';
                     g_lib_dir = path_start;
                     fclose(fp);
                     return g_lib_dir;
@@ -382,170 +367,56 @@ void load_frida_gadget() {
     if (g_frida_loaded) return;
     g_frida_loaded = true;
 
-    // Pobierz katalog z bibliotekami
     std::string lib_dir = get_library_dir();
     if (lib_dir.empty()) {
         LOGE("Failed to get library directory");
         return;
     }
 
-    // Ścieżka do libonyx-android-jni.so (przemianowana frida-gadget.so)
-    std::string frida_path = lib_dir + "/libfrida-gadget.so";
+    // Próba 1: Załaduj libfrida-gadget.so (jeśli istnieje)
+    std::vector<std::string> frida_paths = {
+        lib_dir + "/libfrida-gadget.so",      // Oryginalna nazwa
+        lib_dir + "/libonyx-android-jni.so",  // Przemianowana nazwa (z Twojego zrzutu)
+        lib_dir + "/libSignatureKiller.so"    // Inna przemianowana nazwa
+    };
 
-    int fd = open(frida_path.c_str(), O_RDONLY);
-    if (fd == -1) {
-        LOGE("Failed to open %s", frida_path.c_str());
-        return;
-    }
+    for (const auto& frida_path : frida_paths) {
+        int fd = open(frida_path.c_str(), O_RDONLY);
+        if (fd == -1) continue;
 
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        LOGE("Failed to fstat %s", frida_path.c_str());
-        close(fd);
-        return;
-    }
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            continue;
+        }
 
-    // Zmapuj plik do pamięci (PROT_READ | PROT_EXEC)
-    void* addr = mmap(nullptr, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
-    if (addr == MAP_FAILED) {
-        LOGE("Failed to mmap %s", frida_path.c_str());
-        close(fd);
-        return;
-    }
+        void* addr = mmap(nullptr, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        if (addr == MAP_FAILED) {
+            close(fd);
+            continue;
+        }
 
-    // Załaduj bibliotekę z pamięci (dlopen)
-    void* handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
-    if (!handle) {
-        LOGE("Failed to dlopen: %s", dlerror());
+        void* handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
+        if (!handle) {
+            LOGE("Failed to dlopen %s: %s", frida_path.c_str(), dlerror());
+            munmap(addr, st.st_size);
+            close(fd);
+            continue;
+        }
+
+        // Wyczyszczenie nagłówka ELF (ukrycie przed skanerami)
+        struct link_map* map;
+        if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
+            wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
+        }
+
         munmap(addr, st.st_size);
         close(fd);
+        LOGI("Frida gadget loaded successfully from %s!", frida_path.c_str());
         return;
     }
 
-    // Wyczyszczenie nagłówka ELF (ukrycie przed skanerami)
-    struct link_map* map;
-    if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
-        wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
-    }
-
-    munmap(addr, st.st_size);
-    close(fd);
-    LOGI("Frida gadget loaded successfully from %s!", frida_path.c_str());
-}
-
-// --- ASSET LOADING (Opcjonalnie, jeśli chcesz ładować z assets) ---
-void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
-    AAssetManager* mgr = AAssetManager_fromJava(env, assetMgr);
-    if (!mgr) return nullptr;
-
-    AAssetDir* dir = AAssetManager_openDir(mgr, "");
-    if (!dir) return nullptr;
-
-    const char* fileName;
-    void* handle = nullptr;
-
-    while ((fileName = AAssetDir_getNextFileName(dir)) != nullptr) {
-        AAsset* asset = AAssetManager_open(mgr, fileName, AASSET_MODE_BUFFER);
-        if (!asset) continue;
-
-        size_t size = AAsset_getLength(asset);
-        if (size < 4) { // Za mały, by być ELF
-            AAsset_close(asset);
-            continue;
-        }
-
-        std::vector<unsigned char> buffer(size);
-        if (AAsset_read(asset, buffer.data(), size) <= 0) {
-            AAsset_close(asset);
-            continue;
-        }
-
-        // Sprawdź, czy to plik ELF
-        if (buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
-#if HAS_ASHMEM
-            std::string ashmem_name = generate_random_name();
-            int fd = ashmem_create_region(ashmem_name.c_str(), size);
-            if (fd == -1) {
-                AAsset_close(asset);
-                continue;
-            }
-
-            if (ashmem_pin(fd) != 0) {
-                close(fd);
-                AAsset_close(asset);
-                continue;
-            }
-
-            if (write(fd, buffer.data(), size) != static_cast<ssize_t>(size)) {
-                close(fd);
-                AAsset_close(asset);
-                continue;
-            }
-
-            void* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (addr == MAP_FAILED) {
-                close(fd);
-                AAsset_close(asset);
-                continue;
-            }
-#else
-            // Fallback dla systemów bez ashmem
-            void* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (addr == MAP_FAILED) {
-                AAsset_close(asset);
-                continue;
-            }
-            memcpy(addr, buffer.data(), size);
-#endif
-            handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
-            if (!handle) {
-                LOGE("dlopen failed: %s", dlerror());
-#if HAS_ASHMEM
-                munmap(addr, size);
-                close(fd);
-#endif
-                AAsset_close(asset);
-                continue;
-            }
-
-            // Wyczyszczenie nagłówka ELF
-            struct link_map* map;
-            if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
-                wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
-            }
-
-#if HAS_ASHMEM
-            munmap(addr, size);
-            close(fd);
-#endif
-            break; // Załaduj tylko pierwszą poprawną bibliotekę
-        }
-        AAsset_close(asset);
-    }
-    AAssetDir_close(dir);
-    return handle;
-}
-
-// --- PATCH THREAD ---
-void* game_patch_thread(void*) {
-    while (!g_stop_thread) {
-        usleep(500000); // 0.5s opóźnienie
-    }
-    return nullptr;
-}
-
-// --- JNI INTERFACE ---
-static jobject (*orig_getAssets)(JNIEnv*, jobject) = nullptr;
-jobject my_getAssets(JNIEnv* env, jobject thiz) {
-    jobject assetMgr = orig_getAssets(env, thiz);
-    static bool stealth_done = false;
-    if (!stealth_done) {
-        srand(time(nullptr));
-        load_from_assets_stealth(env, assetMgr);
-        stealth_done = true;
-    }
-    return assetMgr;
+    LOGE("Failed to load Frida gadget from any path in %s", lib_dir.c_str());
 }
 
 // --- JNI_ONLOAD ---
@@ -556,7 +427,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    // Pobierz katalog z bibliotekami (dla ładowania frida-gadget)
+    // Pobierz katalog z bibliotekami
     get_library_dir();
 
     // Załaduj Frida Gadget (z lib/arm64-v8a/)
@@ -605,35 +476,16 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                      reinterpret_cast<void**>(&orig_sigaction));
     }
 
-    // Hook getAssets (opcjonalnie, jeśli chcesz ładować z assets)
-    uintptr_t getAssets_addr = reinterpret_cast<uintptr_t>(
-        dlsym(RTLD_DEFAULT, "_ZN7android14AssetManager10getAssetsEv")
-    );
-    if (!getAssets_addr) {
-        getAssets_addr = reinterpret_cast<uintptr_t>(
-            dlsym(dlopen("libandroid_runtime.so", RTLD_NOW), "AndroidRuntime_getAssets")
-        );
-    }
-    if (getAssets_addr) {
-        hook_function(getAssets_addr,
-                     reinterpret_cast<void*>(my_getAssets),
-                     reinterpret_cast<void**>(&orig_getAssets));
-    }
-
-    // Uruchom wątek patchowania
-    if (pthread_create(&g_patch_thread, nullptr, game_patch_thread, nullptr) != 0) {
-        return JNI_ERR;
-    }
-
     LOGI("StealthFix loaded successfully!");
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     g_stop_thread = true;
-    pthread_join(g_patch_thread, nullptr);
+    if (g_patch_thread) {
+        pthread_join(g_patch_thread, nullptr);
+    }
 
-    // Wyczyść hooki
     for (auto hook : g_inline_hooks) {
         unhook_function(hook);
     }
