@@ -58,7 +58,7 @@ jobs:
 
           echo ""
           echo "Source:"
-          ls -la src
+          ls -la .
 
           echo ""
           echo "CMake:"
