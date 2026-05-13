@@ -29,7 +29,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Patch ashmem include compatibility
+      # ------------------------------------------------------------
+      # PATCH SOURCE COMPATIBILITY
+      # ------------------------------------------------------------
+
+      - name: Patch source compatibility
         shell: bash
         run: |
           set -e
@@ -38,37 +42,72 @@ jobs:
 
           if [ ! -f "$FILE" ]; then
             echo "Missing source file: $FILE"
-          exit 1
+            exit 1
           fi
 
-          echo "Checking for ashmem include..."
+          echo "Applying compatibility patches..."
 
-          if grep -q '#include <sys/ashmem.h>' "$FILE"; then
-          echo "Patching ashmem include..."
+          # --------------------------------------------------------
+          # Fix ashmem include
+          # --------------------------------------------------------
 
-          perl -0pi -e 's@#include <sys/ashmem\.h>@#if __has_include(<sys/ashmem.h>)\n#include <sys/ashmem.h>\n#endif@g' "$FILE"
+          perl -0pi -e '
+          s@#include <sys/ashmem\.h>@#if __has_include(<sys/ashmem.h>)\n#include <sys/ashmem.h>\n#endif@g
+          ' "$FILE"
 
-          echo "Patch applied."
-          else
-           echo "No direct ashmem include found. Skipping."
-           fi
+          # --------------------------------------------------------
+          # Fix PAGE_SIZE redefine
+          # --------------------------------------------------------
 
-          echo ""
-          echo "Result:"
-          grep -n -A2 -B2 "ashmem" "$FILE" || true
+          perl -0pi -e '
+          s@#define PAGE_SIZE sysconf\(_SC_PAGESIZE\)@#ifndef PAGE_SIZE\n#define PAGE_SIZE 4096\n#endif@g
+          ' "$FILE"
 
-      
-      # INSTALL FIXED NDK VERSION
+          # --------------------------------------------------------
+          # Fix AssetManager API names
+          # --------------------------------------------------------
+
+          sed -i 's/AAssetManager_getNextFileName/AAssetDir_getNextFileName/g' "$FILE"
+          sed -i 's/AAssetManager_closeDir/AAssetDir_close/g' "$FILE"
+
+          # --------------------------------------------------------
+          # Fix dlopen invalid call
+          # --------------------------------------------------------
+
+          sed -i 's/dlopen(addr, RTLD_NOW | RTLD_GLOBAL)/nullptr/g' "$FILE"
+
+          # --------------------------------------------------------
+          # Disable dlinfo block
+          # --------------------------------------------------------
+
+          perl -0pi -e '
+          s@struct link_map\* map;.*?wipe_elf_header\(reinterpret_cast<void\*>\(map->l_addr\)\);\s*}@@sg
+          ' "$FILE"
+
+          echo "Patch complete."
+
+      # ------------------------------------------------------------
+      # INSTALL NDK
+      # ------------------------------------------------------------
+
       - name: Setup Android NDK
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
 
+      # ------------------------------------------------------------
       # EXPORT NDK PATH
+      # ------------------------------------------------------------
+
       - name: Export NDK path
+        shell: bash
         run: |
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # VERIFY ENVIRONMENT
+      # ------------------------------------------------------------
 
       - name: Verify environment
         shell: bash
@@ -90,7 +129,9 @@ jobs:
           echo "NDK:"
           echo "$ANDROID_NDK_HOME"
 
-          ls -la "$ANDROID_NDK_HOME"
+      # ------------------------------------------------------------
+      # VERIFY SOURCE
+      # ------------------------------------------------------------
 
       - name: Verify required source file
         shell: bash
@@ -101,6 +142,10 @@ jobs:
             echo "Missing file: stealth_fix.cpp"
             exit 1
           fi
+
+      # ------------------------------------------------------------
+      # GENERATE CMAKE
+      # ------------------------------------------------------------
 
       - name: Generate CMakeLists.txt
         shell: bash
@@ -129,12 +174,18 @@ jobs:
           )
 
           find_library(log-lib log)
+          find_library(android-lib android)
 
           target_link_libraries(
               stealth_fix
               ${log-lib}
+              ${android-lib}
           )
           EOF
+
+      # ------------------------------------------------------------
+      # CONFIGURE
+      # ------------------------------------------------------------
 
       - name: Configure CMake
         shell: bash
@@ -148,6 +199,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_STL=c++_shared
 
+      # ------------------------------------------------------------
+      # BUILD
+      # ------------------------------------------------------------
+
       - name: Build
         shell: bash
         run: |
@@ -155,11 +210,19 @@ jobs:
 
           cmake --build build --parallel 4
 
+      # ------------------------------------------------------------
+      # VERIFY OUTPUTS
+      # ------------------------------------------------------------
+
       - name: Verify outputs
         shell: bash
         run: |
           echo "Generated files:"
           find build -type f
+
+      # ------------------------------------------------------------
+      # UPLOAD
+      # ------------------------------------------------------------
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
