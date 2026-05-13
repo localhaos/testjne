@@ -29,6 +29,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Patch ashmem include compatibility
+        shell: bash
+        run: |
+          set -e
+
+          FILE="stealth_fix.cpp"
+
+          if [ ! -f "$FILE" ]; then
+            echo "Missing source file: $FILE"
+          exit 1
+          fi
+
+          echo "Checking for ashmem include..."
+
+          if grep -q '#include <sys/ashmem.h>' "$FILE"; then
+          echo "Patching ashmem include..."
+
+          perl -0pi -e 's@#include <sys/ashmem\.h>@#if __has_include(<sys/ashmem.h>)\n#include <sys/ashmem.h>\n#endif@g' "$FILE"
+
+          echo "Patch applied."
+          else
+           echo "No direct ashmem include found. Skipping."
+           fi
+
+          echo ""
+          echo "Result:"
+          grep -n -A2 -B2 "ashmem" "$FILE" || true
+
+      
       # INSTALL FIXED NDK VERSION
       - name: Setup Android NDK
         id: setup-ndk
