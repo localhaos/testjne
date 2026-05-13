@@ -1,3 +1,4 @@
+
 #include <jni.h>
 #include <string>
 #include <vector>
@@ -39,7 +40,7 @@
 
 // --- CONFIG ---
 #define LOG_TAG "StealthFix"
-#define DEBUG_MODE 1  // Włącz logi na czas testów (1 = debug, 0 = production)
+#define DEBUG_MODE 1  // Włącz logi na czas testów
 
 #if DEBUG_MODE
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -60,7 +61,7 @@ constexpr uint8_t XOR_KEY = 0x55;
 typedef struct {
     uintptr_t targetAddr;
     uintptr_t replaceAddr;
-    uint8_t backup[16];
+    uint8_t backup[16];  // 8 bajtów dla ARM64/ARM, 5 dla x86
     int enabled;
 } InlineHook;
 
@@ -93,7 +94,7 @@ static std::mutex g_memory_mutex;
 static std::map<std::string, uintptr_t> g_library_bases;
 static std::vector<InlineHook*> g_inline_hooks;
 static bool g_frida_loaded = false;
-static std::string g_lib_dir;
+static std::string g_lib_dir; // Katalog z bibliotekami (lib/arm64-v8a/)
 
 // Blacklist (Frida is NOT included to allow it to work)
 static std::vector<std::string> g_blacklist = {
@@ -115,9 +116,45 @@ static ssize_t (*orig_readlink)(const char*, char*, size_t) = nullptr;
 static int (*orig_sigaction)(int, const struct sigaction*, struct sigaction*) = nullptr;
 static jobject (*orig_getAssets)(JNIEnv*, jobject) = nullptr;
 
+// --- GET LIBRARY DIRECTORY (Pobiera ścieżkę do lib/arm64-v8a/) ---
+std::string get_library_dir() {
+    if (!g_lib_dir.empty()) {
+        return g_lib_dir;
+    }
+
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("Failed to open /proc/self/maps");
+        return "";
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "stealth_fix.so")) {
+            char* path_start = strchr(line, '/');
+            if (path_start) {
+                char* path_end = strrchr(path_start, '/');
+                if (path_end) {
+                    *path_end = '\0';
+                    g_lib_dir = path_start;
+                    fclose(fp);
+                    LOGI("Found library directory: %s", g_lib_dir.c_str());
+                    return g_lib_dir;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    LOGE("Failed to find stealth_fix.so in /proc/self/maps");
+    return "";
+}
+
 // --- MEMORY UTILITIES ---
 uintptr_t find_library_base(const char* lib_name) {
-    if (!lib_name) return 0;
+    if (!lib_name) {
+        LOGE("find_library_base: lib_name is NULL");
+        return 0;
+    }
 
     auto it = g_library_bases.find(lib_name);
     if (it != g_library_bases.end()) {
@@ -126,7 +163,7 @@ uintptr_t find_library_base(const char* lib_name) {
 
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) {
-        LOGE("Failed to open /proc/self/maps");
+        LOGE("Failed to open /proc/self/maps in find_library_base");
         return 0;
     }
 
@@ -146,14 +183,24 @@ uintptr_t find_library_base(const char* lib_name) {
 }
 
 bool change_memory_protection(void* addr, int prot) {
-    if (!addr) return false;
+    if (!addr) {
+        LOGE("change_memory_protection: addr is NULL");
+        return false;
+    }
 
     uintptr_t page_start = PAGE_START(reinterpret_cast<uintptr_t>(addr));
-    return mprotect(reinterpret_cast<void*>(page_start), PAGE_SIZE, prot) == 0;
+    if (mprotect(reinterpret_cast<void*>(page_start), PAGE_SIZE, prot) != 0) {
+        LOGE("mprotect failed for addr %p with prot %d", addr, prot);
+        return false;
+    }
+    return true;
 }
 
 void wipe_elf_header(void* base_addr) {
-    if (!base_addr) return;
+    if (!base_addr) {
+        LOGE("wipe_elf_header: base_addr is NULL");
+        return;
+    }
 
     uintptr_t page_start = PAGE_START(reinterpret_cast<uintptr_t>(base_addr));
     if (!change_memory_protection(reinterpret_cast<void*>(page_start), PROT_READ | PROT_WRITE)) {
@@ -166,7 +213,7 @@ void wipe_elf_header(void* base_addr) {
     }
 }
 
-// --- INLINE HOOK IMPLEMENTATION (SAFE VERSION) ---
+// --- INLINE HOOK IMPLEMENTATION (Multi-Architecture Support) ---
 int InlineHook_init(InlineHook* hook, uintptr_t targetAddr, uintptr_t replaceAddr) {
     if (!hook) {
         LOGE("InlineHook_init: hook is NULL");
@@ -177,37 +224,30 @@ int InlineHook_init(InlineHook* hook, uintptr_t targetAddr, uintptr_t replaceAdd
     hook->replaceAddr = replaceAddr;
     hook->enabled = 0;
 
+    // Zabezpiecz pamięć przed modyfikacją
+    uintptr_t pageStart = PAGE_START(targetAddr);
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_WRITE | PROT_EXEC)) {
+        LOGE("InlineHook_init: mprotect failed for %p", (void*)targetAddr);
+        return -1;
+    }
+
 #if defined(__aarch64__)
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect failed for ARM64");
-        return -1;
-    }
     memcpy(hook->backup, (void*)targetAddr, 8);
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect restore failed for ARM64");
-        return -1;
-    }
 #elif defined(__arm__)
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect failed for ARM");
-        return -1;
-    }
     memcpy(hook->backup, (void*)targetAddr, 8);
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect restore failed for ARM");
-        return -1;
-    }
-#elif defined(__i386__)
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect failed for x86");
-        return -1;
-    }
+#elif defined(__i386__) || defined(__x86_64__)
     memcpy(hook->backup, (void*)targetAddr, 5);
-    if (mprotect((void*)PAGE_START(targetAddr), PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
-        LOGE("InlineHook_init: mprotect restore failed for x86");
+#else
+    LOGE("InlineHook_init: Unsupported architecture");
+    return -1;
+#endif
+
+    // Przywróć ochronę pamięci
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
+        LOGE("InlineHook_init: mprotect restore failed for %p", (void*)targetAddr);
         return -1;
     }
-#endif
+
     return 0;
 }
 
@@ -222,36 +262,47 @@ int InlineHook_enable(InlineHook* hook) {
     }
 
     uintptr_t pageStart = hook->targetAddr & ~(PAGE_SIZE - 1);
-    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_WRITE | PROT_EXEC)) {
         LOGE("InlineHook_enable: mprotect failed for page %p", (void*)pageStart);
         return -1;
     }
 
 #if defined(__aarch64__)
-    uint32_t patch[2] = { 0x58000051, 0xD61F0220 }; // LDR X17, #8; BR X17
+    // ARM64: LDR X17, #8; BR X17
+    uint32_t patch[2] = { 0x58000051, 0xD61F0220 };
     memcpy((void*)hook->targetAddr, patch, 8);
 
     uintptr_t* trampoline = (uintptr_t*)mmap(NULL, 16, PROT_READ | PROT_WRITE | PROT_EXEC,
                                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (trampoline == MAP_FAILED) {
         LOGE("InlineHook_enable: mmap failed for trampoline");
-        mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_EXEC);
+        if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
+            LOGE("InlineHook_enable: Failed to restore mprotect after mmap failure");
+        }
         return -1;
     }
     *trampoline = hook->replaceAddr;
     *(uintptr_t*)(hook->targetAddr + 8) = (uintptr_t)trampoline;
 #elif defined(__arm__)
+    // ARM: LDR PC, [PC, #-4]
     uint32_t patch[2] = { 0xE51FF004, static_cast<uint32_t>(hook->replaceAddr) };
     memcpy((void*)hook->targetAddr, patch, 8);
-#elif defined(__i386__)
+#elif defined(__i386__) || defined(__x86_64__)
+    // x86/x86_64: JMP rel32
     uint8_t patch[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
     uint32_t* offset_ptr = (uint32_t*)(patch + 1);
     *offset_ptr = hook->replaceAddr - (hook->targetAddr + 5);
     memcpy((void*)hook->targetAddr, patch, 5);
+#else
+    LOGE("InlineHook_enable: Unsupported architecture");
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
+        LOGE("InlineHook_enable: Failed to restore mprotect for unsupported arch");
+    }
+    return -1;
 #endif
 
     hook->enabled = 1;
-    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
         LOGE("InlineHook_enable: mprotect restore failed");
         return -1;
     }
@@ -270,19 +321,25 @@ int InlineHook_disable(InlineHook* hook) {
     }
 
     uintptr_t pageStart = hook->targetAddr & ~(PAGE_SIZE - 1);
-    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_WRITE | PROT_EXEC)) {
         LOGE("InlineHook_disable: mprotect failed");
         return -1;
     }
 
 #if defined(__aarch64__) || defined(__arm__)
     memcpy((void*)hook->targetAddr, hook->backup, 8);
-#elif defined(__i386__)
+#elif defined(__i386__) || defined(__x86_64__)
     memcpy((void*)hook->targetAddr, hook->backup, 5);
+#else
+    LOGE("InlineHook_disable: Unsupported architecture");
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
+        LOGE("InlineHook_disable: Failed to restore mprotect for unsupported arch");
+    }
+    return -1;
 #endif
 
     hook->enabled = 0;
-    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
+    if (!change_memory_protection(reinterpret_cast<void*>(pageStart), PROT_READ | PROT_EXEC)) {
         LOGE("InlineHook_disable: mprotect restore failed");
         return -1;
     }
@@ -337,7 +394,7 @@ void unhook_function(InlineHook* hook) {
     delete hook;
 }
 
-// --- ANTI-DETECTION HOOKS (SAFE VERSIONS) ---
+// --- ANTI-DETECTION HOOKS (Safe Versions) ---
 long my_syscall(long number, ...) {
     if (number == __NR_ptrace) {
         va_list args;
@@ -361,7 +418,7 @@ long my_syscall(long number, ...) {
         va_end(args);
         return result;
     }
-    return -ENOSYS; // Fallback jeśli orig_syscall nie jest zainicjowany
+    return -ENOSYS;
 }
 
 int my_prctl(int option, ...) {
@@ -465,6 +522,77 @@ int my_sigaction(int signum, const struct sigaction* act, struct sigaction* olda
     return -ENOSYS;
 }
 
+// --- FRIDA GADGET LOADING (Z lib/arm64-v8a/) ---
+void load_frida_gadget() {
+    if (g_frida_loaded) {
+        LOGI("Frida gadget already loaded");
+        return;
+    }
+    g_frida_loaded = true;
+
+    std::string lib_dir = get_library_dir();
+    if (lib_dir.empty()) {
+        LOGE("Failed to get library directory, cannot load Frida gadget");
+        return;
+    }
+
+    // Lista możliwych nazw pliku Frida Gadget
+    std::vector<std::string> frida_paths = {
+        lib_dir + "/libfrida-gadget.so",      // Oryginalna nazwa
+        lib_dir + "/libonyx-android-jni.so",  // Przemianowana (z Twojego zrzutu)
+        lib_dir + "/libSignatureKiller.so",   // Inna przemianowana nazwa
+        lib_dir + "/libcustom.so"             // Alternatywna nazwa
+    };
+
+    for (const auto& frida_path : frida_paths) {
+        LOGI("Trying to load Frida gadget from: %s", frida_path.c_str());
+
+        int fd = open(frida_path.c_str(), O_RDONLY);
+        if (fd == -1) {
+            LOGI("File not found: %s", frida_path.c_str());
+            continue;
+        }
+
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            LOGE("fstat failed for %s", frida_path.c_str());
+            close(fd);
+            continue;
+        }
+
+        // Zmapuj plik do pamięci (PROT_READ | PROT_EXEC)
+        void* addr = mmap(nullptr, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        if (addr == MAP_FAILED) {
+            LOGE("mmap failed for %s", frida_path.c_str());
+            close(fd);
+            continue;
+        }
+
+        // Załaduj bibliotekę z pamięci (dlopen)
+        void* handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
+        if (!handle) {
+            LOGE("dlopen failed for %s: %s", frida_path.c_str(), dlerror());
+            munmap(addr, st.st_size);
+            close(fd);
+            continue;
+        }
+
+        // Wyczyszczenie nagłówka ELF (ukrycie przed skanerami)
+        struct link_map* map;
+        if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
+            wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
+            LOGI("Wiped ELF header for Frida gadget");
+        }
+
+        munmap(addr, st.st_size);
+        close(fd);
+        LOGI("Frida gadget loaded successfully from %s!", frida_path.c_str());
+        return;
+    }
+
+    LOGI("Frida gadget not found in any expected location (this is OK if you don't need Frida)");
+}
+
 // --- JNI INTERFACE ---
 jobject my_getAssets(JNIEnv* env, jobject thiz) {
     if (!orig_getAssets) {
@@ -478,7 +606,7 @@ jobject my_getAssets(JNIEnv* env, jobject thiz) {
     if (!stealth_done) {
         stealth_done = true;
         srand(time(nullptr));
-        // Możesz tutaj dodać ładowanie z assets jeśli potrzebujesz
+        // Tutaj możesz dodać ładowanie z assets jeśli potrzebujesz
     }
     return assetMgr;
 }
@@ -492,9 +620,35 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    LOGI("StealthFix: Starting initialization");
+    LOGI("===== StealthFix Initialization Started =====");
+    LOGI("Architecture: %s",
+#if defined(__aarch64__)
+        "ARM64"
+#elif defined(__arm__)
+        "ARMv7"
+#elif defined(__i386__)
+        "x86"
+#elif defined(__x86_64__)
+        "x86_64"
+#else
+        "Unknown"
+#endif
+    );
 
-    // Inicjalizuj hooki systemowe (BEZPIECZNE)
+    // Pobierz katalog z bibliotekami
+    get_library_dir();
+    if (!g_lib_dir.empty()) {
+        LOGI("Library directory: %s", g_lib_dir.c_str());
+    } else {
+        LOGE("Warning: Could not determine library directory");
+    }
+
+    // Załaduj Frida Gadget (opcjonalnie, nie powoduje crashu jeśli nie ma pliku)
+    load_frida_gadget();
+
+    // Inicjalizuj hooki systemowe
+    LOGI("Initializing system hooks...");
+
     void* syscall_addr = dlsym(RTLD_DEFAULT, "syscall");
     if (syscall_addr) {
         LOGI("Hooking syscall at %p", syscall_addr);
@@ -585,7 +739,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         }
     }
 
-    LOGI("StealthFix: Initialization completed successfully");
+    LOGI("===== StealthFix Initialization Completed =====");
     return JNI_VERSION_1_6;
 }
 
