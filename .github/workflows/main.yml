@@ -29,20 +29,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate Android NDK
-        shell: bash
+      # INSTALL FIXED NDK VERSION
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      # EXPORT NDK PATH
+      - name: Export NDK path
         run: |
-          set -e
-
-          NDK_PATH=$(find /usr/local/lib/android/sdk/ndk \
-            -maxdepth 1 \
-            -mindepth 1 \
-            -type d | sort | tail -n 1)
-
-          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
-
-          echo "Using NDK:"
-          echo "$NDK_PATH"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
 
       - name: Verify environment
         shell: bash
@@ -57,15 +54,13 @@ jobs:
           ls -la
 
           echo ""
-          echo "Source:"
-          ls -la .
-
-          echo ""
           echo "CMake:"
           cmake --version
 
           echo ""
           echo "NDK:"
+          echo "$ANDROID_NDK_HOME"
+
           ls -la "$ANDROID_NDK_HOME"
 
       - name: Verify required source file
@@ -77,9 +72,6 @@ jobs:
             echo "Missing file: stealth_fix.cpp"
             exit 1
           fi
-
-          echo "Using source from repository:"
-          cat stealth_fix.cpp
 
       - name: Generate CMakeLists.txt
         shell: bash
