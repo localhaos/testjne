@@ -48,17 +48,12 @@ jobs:
           ls -la
 
           echo ""
-          echo "CMake:"
-          cmake --version
+          echo "Source:"
+          ls -la src
 
           echo ""
-          echo "NDK:"
-          ls -la $ANDROID_NDK_HOME
-
-      - name: Create project structure
-        run: |
-          mkdir -p src
-          mkdir -p include
+          echo "CMake:"
+          cmake --version
 
       - name: Generate CMakeLists.txt
         run: |
@@ -79,12 +74,6 @@ jobs:
               src/stealth_fix.cpp
           )
 
-          target_include_directories(
-              stealth_fix
-              PRIVATE
-              include
-          )
-
           find_library(log-lib log)
 
           target_link_libraries(
@@ -93,46 +82,23 @@ jobs:
           )
           EOF
 
-      - name: Generate source
-        run: |
-          cat > src/stealth_fix.cpp << 'EOF'
-          #include <jni.h>
-          #include <android/log.h>
-
-          #define LOG_TAG "stealth_fix"
-
-          extern "C"
-          JNIEXPORT jint JNICALL
-          JNI_OnLoad(JavaVM* vm, void* reserved) {
-
-              __android_log_print(
-                  ANDROID_LOG_INFO,
-                  LOG_TAG,
-                  "Frida stealth bypass loaded"
-              );
-
-              return JNI_VERSION_1_6;
-          }
-          EOF
-
       - name: Configure CMake
         run: |
-          cmake -S . -B build \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+          cmake -B build \
             -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=${ANDROID_PLATFORM} \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_STL=c++_shared
 
       - name: Build
         run: |
-          cmake --build build --parallel $(nproc)
+          cmake --build build --config Release -j$(nproc)
 
-      - name: Verify outputs
+      - name: Verify output
         run: |
-          echo "Generated files:"
-          find build -type f
+          find build -name "*.so"
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: stealth_fix-${{ matrix.abi }}
