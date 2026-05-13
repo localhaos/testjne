@@ -73,13 +73,13 @@ jobs:
         run: |
           set -e
 
-          if [ ! -f src/stealth_fix.cpp ]; then
-            echo "Missing file: src/stealth_fix.cpp"
+          if [ ! -f stealth_fix.cpp ]; then
+            echo "Missing file: stealth_fix.cpp"
             exit 1
           fi
 
           echo "Using source from repository:"
-          cat src/stealth_fix.cpp
+          cat stealth_fix.cpp
 
       - name: Generate CMakeLists.txt
         shell: bash
@@ -98,7 +98,7 @@ jobs:
           add_library(
               stealth_fix
               SHARED
-              src/stealth_fix.cpp
+              stealth_fix.cpp
           )
 
           target_include_directories(
