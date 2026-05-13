@@ -25,13 +25,11 @@
 #include <algorithm>
 #include <random>
 #include <ctime>
-
-// --- And64InlineHook ---
-#include "And64InlineHook.h"
+#include <sys/ashmem.h>
 
 // --- KONFIGURACJA ---
-#define LOG_TAG "SystemUtils"  // Zmieniona nazwa, by nie rzucać się w oczu
-#define DEBUG_MODE 0            // 0 = wyłącz logi (produkcja), 1 = włącz logi (debug)
+#define LOG_TAG "SystemUtils"
+#define DEBUG_MODE 0  // 0 = wyłącz logi (produkcja), 1 = włącz logi (debug)
 
 #if DEBUG_MODE
     #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -46,21 +44,82 @@
 #define PAGE_MASK (~(PAGE_SIZE - 1))
 #define PAGE_START(addr) ((uintptr_t)(addr) & PAGE_MASK)
 
-// Klucz XOR (losowo generowany przy kompilacji)
+// Klucz XOR
 constexpr uint8_t XOR_KEY = 0x55;
 
-// Losowa nazwa dla memfd (zmieniana przy każdym uruchomieniu)
-std::string generate_random_memfd_name() {
-    static const char alphanum[] =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz";
-    std::string name = "lib";
-    for (int i = 0; i < 8; ++i) {
-        name += alphanum[rand() % (sizeof(alphanum) - 1)];
+// --- AND64INLINEHOOK (WŁASNA IMPLEMENTACJA) ---
+typedef struct {
+    uintptr_t targetAddr;
+    uintptr_t replaceAddr;
+    uint8_t backup[16];  // Oryginalne bajty (8 bajtów dla ARM64, 5 dla x86, 8 dla ARM)
+    int enabled;
+} InlineHook;
+
+int InlineHook_init(InlineHook* hook, uintptr_t targetAddr, uintptr_t replaceAddr) {
+    if (!hook) return -1;
+    hook->targetAddr = targetAddr;
+    hook->replaceAddr = replaceAddr;
+    hook->enabled = 0;
+
+    // ARM64: 8 bajtów, ARM/x86: 5-8 bajtów
+    #if defined(__aarch64__)
+        memcpy(hook->backup, (void*)targetAddr, 8);
+    #elif defined(__arm__)
+        memcpy(hook->backup, (void*)targetAddr, 8);
+    #elif defined(__i386__)
+        memcpy(hook->backup, (void*)targetAddr, 5);
+    #endif
+    return 0;
+}
+
+int InlineHook_enable(InlineHook* hook) {
+    if (!hook || hook->enabled) return -1;
+
+    uintptr_t pageStart = hook->targetAddr & ~(PAGE_SIZE - 1);
+    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -1;
     }
-    name += ".so";
-    return name;
+
+    #if defined(__aarch64__)
+        // ARM64: LDR X17, #8; BR X17
+        uint32_t patch[2] = { 0x58000051, 0xD61F0220 };
+        memcpy((void*)hook->targetAddr, patch, 8);
+        *(uintptr_t*)(hook->targetAddr + 8) = hook->replaceAddr;
+    #elif defined(__arm__)
+        // ARM: LDR PC, [PC, #-4]
+        uint32_t patch[2] = { 0xE51FF004, static_cast<uint32_t>(hook->replaceAddr) };
+        memcpy((void*)hook->targetAddr, patch, 8);
+    #elif defined(__i386__)
+        // x86: JMP rel32
+        uint8_t patch[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
+        *(uint32_t*)(patch + 1) = hook->replaceAddr - (hook->targetAddr + 5);
+        memcpy((void*)hook->targetAddr, patch, 5);
+    #endif
+
+    hook->enabled = 1;
+    mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)hook->targetAddr, (char*)(hook->targetAddr + 16));
+    return 0;
+}
+
+int InlineHook_disable(InlineHook* hook) {
+    if (!hook || !hook->enabled) return -1;
+
+    uintptr_t pageStart = hook->targetAddr & ~(PAGE_SIZE - 1);
+    if (mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -1;
+    }
+
+    #if defined(__aarch64__) || defined(__arm__)
+        memcpy((void*)hook->targetAddr, hook->backup, 8);
+    #elif defined(__i386__)
+        memcpy((void*)hook->targetAddr, hook->backup, 5);
+    #endif
+
+    hook->enabled = 0;
+    mprotect((void*)pageStart, PAGE_SIZE, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)hook->targetAddr, (char*)(hook->targetAddr + 16));
+    return 0;
 }
 
 // --- STRUKTURY DANYCH ---
@@ -113,7 +172,6 @@ static std::vector<std::string> g_blacklist = {
     decrypt_string({0x2B, 0x20, 0x27, 0x20, 0x26, 0x21, 0x28, 0x2D}), // "linjector"
     decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}), // "magisk"
     decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
-    decrypt_string({0x1D, 0x10, 0x06, 0x01, 0x04, 0x0D}), // "gum-js-loop"
 };
 
 // --- FUNKCJE POMOCNICZE ---
@@ -135,31 +193,46 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
     return bytes;
 }
 
-// --- ANTI-PTRACE (Blokowanie Fridy) ---
-// Hook dla ptrace (SYSCALL 101 na ARM64)
-static long (*orig_ptrace)(int request, pid_t pid, void* addr, void* data) = nullptr;
-long my_ptrace(int request, pid_t pid, void* addr, void* data) {
-    if (request == PTRACE_ATTACH || request == PTRACE_TRACEME) {
-        LOGE(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
-        return -EPERM; // Blokuj attach
+std::string generate_random_name() {
+    static const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::string name = "lib";
+    for (int i = 0; i < 8; ++i) {
+        name += alphanum[rand() % (sizeof(alphanum) - 1)];
     }
-    return orig_ptrace(request, pid, addr, data);
+    name += ".so";
+    return name;
+}
+
+// --- ANTI-DETEKCJA ---
+// Hook dla syscall (blokowanie ptrace)
+static long (*orig_syscall)(long number, ...) = nullptr;
+long my_syscall(long number, ...) {
+    if (number == 101) { // __NR_ptrace
+        return -EPERM;
+    }
+    va_list args;
+    va_start(args, number);
+    long result = orig_syscall(number, args);
+    va_end(args);
+    return result;
 }
 
 // Hook dla prctl (blokowanie PR_SET_DUMPABLE)
-static int (*orig_prctl)(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) = nullptr;
-int my_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
+static int (*orig_prctl)(int option, ...) = nullptr;
+int my_prctl(int option, ...) {
     if (option == PR_SET_DUMPABLE) {
-        LOGE(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
-        return -EINVAL; // Blokuj PR_SET_DUMPABLE
+        return -EINVAL;
     }
-    return orig_prctl(option, arg2, arg3, arg4, arg5);
+    va_list args;
+    va_start(args, option);
+    int result = orig_prctl(option, args);
+    va_end(args);
+    return result;
 }
 
-// --- WYSZUKIWANIE WZORCÓW BAJTÓW ---
+// --- WYSZUKIWANIE WZORCÓW ---
 uintptr_t find_pattern(uintptr_t start, uintptr_t end, const BytePattern& pattern) {
     if (pattern.pattern.empty() || start >= end) return 0;
-
     const uint8_t* mem = reinterpret_cast<const uint8_t*>(start);
     size_t mem_size = end - start;
     size_t pattern_size = pattern.pattern.size();
@@ -198,7 +271,6 @@ uintptr_t find_pattern_in_library(const std::string& lib_name, const BytePattern
         }
     }
     fclose(fp);
-
     if (!lib_end) return 0;
     return find_pattern(lib_base, lib_end, pattern);
 }
@@ -243,21 +315,14 @@ bool change_memory_protection(void* addr, int prot) {
 
 bool hex_patch(uintptr_t addr, const std::vector<uint8_t>& new_bytes) {
     std::lock_guard<std::mutex> lock(g_memory_mutex);
-
     if (!change_memory_protection(reinterpret_cast<void*>(addr), PROT_READ | PROT_WRITE | PROT_EXEC)) {
         return false;
     }
-
     memcpy(reinterpret_cast<void*>(addr), new_bytes.data(), new_bytes.size());
-
     if (!change_memory_protection(reinterpret_cast<void*>(addr), PROT_READ | PROT_EXEC)) {
         return false;
     }
-
-    #if defined(__arm__) || defined(__aarch64__)
-        __builtin___clear_cache(reinterpret_cast<char*>(addr), reinterpret_cast<char*>(addr + new_bytes.size()));
-    #endif
-
+    __builtin___clear_cache(reinterpret_cast<char*>(addr), reinterpret_cast<char*>(addr + new_bytes.size()));
     return true;
 }
 
@@ -278,16 +343,13 @@ InlineHook* hook_function(uintptr_t target_addr, void* new_func, void** orig_fun
         delete hook;
         return nullptr;
     }
-
     if (InlineHook_enable(hook) != 0) {
         delete hook;
         return nullptr;
     }
-
     if (orig_func) {
         *orig_func = reinterpret_cast<void*>(hook->targetAddr);
     }
-
     g_inline_hooks.push_back(hook);
     return hook;
 }
@@ -302,7 +364,7 @@ void unhook_function(InlineHook* hook) {
     delete hook;
 }
 
-// --- HOOKI SYSTEMOWE (STEALTH) ---
+// --- HOOKI SYSTEMOWE ---
 bool contains_blacklist(const char* str) {
     if (!str) return false;
     for (const auto& keyword : g_blacklist) {
@@ -334,7 +396,7 @@ char* my_fgets(char* s, int size, FILE* stream) {
 // --- PRZYKŁADOWE BYPASY ---
 int (*old_IsEnable)(int, char*, int) = nullptr;
 int IsEnable(int a1, char* NameOfThread, int a3) {
-    if (strstr(NameOfThread, decrypt_string({0x1E, 0x10, 0x0F, 0x00, 0x18, 0x0D}).c_str()) ||  // "opcode"
+    if (strstr(NameOfThread, decrypt_string({0x1E, 0x10, 0x0F, 0x00, 0x18, 0x0D}).c_str()) || // "opcode"
         strstr(NameOfThread, decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}).c_str())) { // "memory"
         return 0;
     }
@@ -351,7 +413,7 @@ void hook_AnoSDKExport() {
     orig_AnoSDKExport();
 }
 
-// --- ŁADOWANIE BEZPLIKOWE (MEMFD) ---
+// --- ŁADOWANIE BEZPLIKOWE (ASHMEM) ---
 void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
     AAssetManager* mgr = AAssetManager_fromJava(env, assetMgr);
     if (!mgr) return nullptr;
@@ -372,23 +434,29 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
         }
 
         if (size >= 4 && buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
-            std::string memfd_name = generate_random_memfd_name();
-            int fd = syscall(__NR_memfd_create, memfd_name.c_str(), MFD_CLOEXEC);
+            std::string ashmem_name = generate_random_name();
+            int fd = ashmem_create_region(ashmem_name.c_str(), size);
             if (fd == -1) {
                 AAsset_close(asset);
                 continue;
             }
 
-            if (ftruncate(fd, size) == -1 || write(fd, buffer.data(), size) != static_cast<ssize_t>(size)) {
+            if (ashmem_pin(fd) != 0 || write(fd, buffer.data(), size) != static_cast<ssize_t>(size)) {
                 close(fd);
                 AAsset_close(asset);
                 continue;
             }
 
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-            void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+            void* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (addr == MAP_FAILED) {
+                close(fd);
+                AAsset_close(asset);
+                continue;
+            }
+
+            void* handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
             if (!handle) {
+                munmap(addr, size);
                 close(fd);
                 AAsset_close(asset);
                 continue;
@@ -398,6 +466,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
             if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
                 wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
             }
+            munmap(addr, size);
             close(fd);
             AAssetManager_closeDir(dir);
             return handle;
@@ -410,7 +479,6 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
 
 // --- WĄTEK PATCHOWANIA ---
 void* game_patch_thread(void*) {
-    // Czekaj na załadowanie bibliotek
     for (const auto& patch : g_patches) {
         while (!g_stop_thread && !is_library_loaded(patch.library_name)) {
             usleep(100000);
@@ -418,7 +486,6 @@ void* game_patch_thread(void*) {
         if (g_stop_thread) return nullptr;
     }
 
-    // Zastosuj patch'e
     for (const auto& patch : g_patches) {
         uintptr_t target_addr = find_pattern_in_library(patch.library_name, patch.pattern);
         if (!target_addr) continue;
@@ -426,7 +493,6 @@ void* game_patch_thread(void*) {
         hex_patch(target_addr, patch.new_bytes);
     }
 
-    // Zastosuj hooki i bypassy
     for (const auto& hook : g_hooks) {
         uintptr_t target_addr = 0;
         if (!hook.pattern.pattern.empty()) {
@@ -464,16 +530,9 @@ void add_patch(const PatchConfig& patch) { g_patches.push_back(patch); }
 void add_bypass(const BypassConfig& bypass) { g_bypasses.push_back(bypass); }
 
 void init_stealth_hooks() {
-    // Hook openat (ukrywanie plików)
     add_hook({ "libc.so", "openat", reinterpret_cast<void*>(my_openat), reinterpret_cast<void**>(&orig_openat), {}, 0 });
-
-    // Hook fgets (ukrywanie w /proc/self/maps)
     add_hook({ "libc.so", "fgets", reinterpret_cast<void*>(my_fgets), reinterpret_cast<void**>(&orig_fgets), {}, 0 });
-
-    // Hook ptrace (blokowanie Fridy)
-    add_hook({ "libc.so", "ptrace", reinterpret_cast<void*>(my_ptrace), reinterpret_cast<void**>(&orig_ptrace), {}, 0 });
-
-    // Hook prctl (blokowanie PR_SET_DUMPABLE)
+    add_hook({ "libc.so", "syscall", reinterpret_cast<void*>(my_syscall), reinterpret_cast<void**>(&orig_syscall), {}, 0 });
     add_hook({ "libc.so", "prctl", reinterpret_cast<void*>(my_prctl), reinterpret_cast<void**>(&orig_prctl), {}, 0 });
 }
 
@@ -483,7 +542,6 @@ void init_default_bypasses() {
 }
 
 void init_default_patches() {
-    // Przykładowe wzorce (trzeba dostosować do rzeczywistych bibliotek)
     add_patch({
         "libanogs.so",
         { hex_to_bytes("00 00 A0 E3 1E FF 2F E1"), {true, true, true, true, true, true, true, true}, 0 },
@@ -498,7 +556,7 @@ jobject my_getAssets(JNIEnv* env, jobject thiz) {
     jobject assetMgr = orig_getAssets(env, thiz);
     static bool stealth_done = false;
     if (!stealth_done) {
-        srand(time(nullptr)); // Inicjalizacja generatora losowego
+        srand(time(nullptr));
         load_from_assets_stealth(env, assetMgr);
         stealth_done = true;
     }
@@ -513,12 +571,17 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    // Inicjalizacja domyślnych hooków, patch'y i bypassów
+    // Sprawdź, czy proces jest debugowany
+    if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) {
+        return JNI_ERR;
+    }
+
+    // Inicjalizacja
     init_stealth_hooks();
     init_default_bypasses();
     init_default_patches();
 
-    // Hook getAssets (trigger loadera)
+    // Hook getAssets
     uintptr_t getAssets_addr = reinterpret_cast<uintptr_t>(
         dlsym(RTLD_DEFAULT, "_ZN7android14AssetManager10getAssetsEv")
     );
@@ -536,10 +599,6 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    // Zaszyfrowany log (tylko w trybie debug)
-    LOGI(decrypt_string({0x1E, 0x11, 0x0F, 0x00, 0x18, 0x0D, 0x00, 0x06, 0x12, 0x00, 0x0D, 0x00, 0x1F, 0x04, 0x00, 0x12, 0x10}).c_str());
-    // "StealthLoader initialized"
-
     return JNI_VERSION_1_6;
 }
 
@@ -550,7 +609,5 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
         unhook_function(hook);
     }
     g_inline_hooks.clear();
-    if (pthread_join(g_patch_thread, nullptr) != 0) {
-        // Ignoruj błąd
-    }
+    pthread_join(g_patch_thread, nullptr);
 }
