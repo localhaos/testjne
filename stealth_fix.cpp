@@ -27,8 +27,8 @@
 #include <algorithm>
 #include <random>
 #include <ctime>
-#include <inttypes.h>  // For SCNxPTR
-#include <sys/prctl.h> // For PR_SET_DUMPABLE
+#include <inttypes.h>
+#include <sys/prctl.h>
 
 #if __has_include(<sys/ashmem.h>)
 #include <sys/ashmem.h>
@@ -57,7 +57,7 @@
 // XOR key for string obfuscation
 constexpr uint8_t XOR_KEY = 0x55;
 
-// --- INLINE HOOK STRUCT (MUST BE DEFINED BEFORE USE) ---
+// --- INLINE HOOK STRUCT ---
 typedef struct {
     uintptr_t targetAddr;
     uintptr_t replaceAddr;
@@ -65,7 +65,7 @@ typedef struct {
     int enabled;
 } InlineHook;
 
-// --- HELPER FUNCTIONS (MUST BE DEFINED BEFORE USE IN GLOBALS) ---
+// --- HELPER FUNCTIONS ---
 std::string decrypt_string(const std::vector<uint8_t>& cipher) {
     std::string output;
     for (uint8_t b : cipher) {
@@ -97,7 +97,7 @@ std::string generate_random_name() {
     return name;
 }
 
-// --- GLOBALS (NOW AFTER DECLARATIONS) ---
+// --- GLOBALS ---
 static JavaVM* g_jvm = nullptr;
 static pthread_t g_patch_thread;
 static volatile bool g_stop_thread = false;
@@ -105,6 +105,7 @@ static std::mutex g_memory_mutex;
 static std::map<std::string, uintptr_t> g_library_bases;
 static std::vector<InlineHook*> g_inline_hooks;
 static bool g_frida_loaded = false;
+static std::string g_lib_dir; // Katalog z bibliotekami (lib/arm64-v8a/)
 
 // Blacklist (Frida is NOT included to allow it to work)
 static std::vector<std::string> g_blacklist = {
@@ -115,6 +116,39 @@ static std::vector<std::string> g_blacklist = {
     decrypt_string({0x2D, 0x20, 0x27, 0x21, 0x28, 0x26}), // "magisk"
     decrypt_string({0x1F, 0x10, 0x07, 0x04, 0x0D, 0x00}), // "frida-server"
 };
+
+// --- GET LIBRARY DIRECTORY (Dla ładowania z lib/arm64-v8a/) ---
+std::string get_library_dir() {
+    if (!g_lib_dir.empty()) {
+        return g_lib_dir;
+    }
+
+    // Szukaj ścieżki do stealth_fix.so w /proc/self/maps
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("Failed to open /proc/self/maps");
+        return "";
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "stealth_fix.so")) {
+            // Wyodrębnij ścieżkę do katalogu
+            char* path_start = strchr(line, '/');
+            if (path_start) {
+                char* path_end = strrchr(path_start, '/');
+                if (path_end) {
+                    *path_end = '\0'; // Obetnij nazwę pliku
+                    g_lib_dir = path_start;
+                    fclose(fp);
+                    return g_lib_dir;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    return "";
+}
 
 // --- MEMORY UTILITIES ---
 uintptr_t find_library_base(const char* lib_name) {
@@ -265,9 +299,9 @@ long my_syscall(long number, ...) {
         long request = va_arg(args, long);
         va_end(args);
         if (request == PTRACE_TRACEME) {
-            return orig_syscall(number, args);
+            return orig_syscall(number, args); // Pozwól Fridzie na podpięcie
         }
-        return -EPERM;
+        return -EPERM; // Blokuj inne operacje ptrace
     }
     va_list args;
     va_start(args, number);
@@ -279,7 +313,7 @@ long my_syscall(long number, ...) {
 static int (*orig_prctl)(int option, ...) = nullptr;
 int my_prctl(int option, ...) {
     if (option == PR_SET_DUMPABLE) {
-        return -EINVAL;
+        return -EINVAL; // Blokuj dumpowanie pamięci
     }
     va_list args;
     va_start(args, option);
@@ -311,7 +345,7 @@ static char* (*orig_fgets)(char*, int, FILE*) = nullptr;
 char* my_fgets(char* s, int size, FILE* stream) {
     char* result = orig_fgets(s, size, stream);
     if (result && contains_blacklist(result)) {
-        return my_fgets(s, size, stream);
+        return my_fgets(s, size, stream); // Pomijaj linie z blacklisty
     }
     return result;
 }
@@ -325,7 +359,7 @@ ssize_t my_readlink(const char* pathname, char* buf, size_t bufsiz) {
             "Tgid:\t12345\n"
             "Pid:\t12345\n"
             "PPid:\t1234\n"
-            "TracerPid:\t0\n";
+            "TracerPid:\t0\n"; // Ukryj TracerPid
         strncpy(buf, fake_status, bufsiz - 1);
         buf[bufsiz - 1] = '\0';
         return strlen(fake_status);
@@ -338,37 +372,48 @@ int my_sigaction(int signum, const struct sigaction* act, struct sigaction* olda
     if (signum == SIGSEGV || signum == SIGBUS || signum == SIGABRT) {
         struct sigaction ignore_act = {0};
         ignore_act.sa_handler = SIG_IGN;
-        return orig_sigaction(signum, &ignore_act, oldact);
+        return orig_sigaction(signum, &ignore_act, oldact); // Blokuj tombstone
     }
     return orig_sigaction(signum, act, oldact);
 }
 
-// --- FRIDA GADGET LOADING ---
+// --- FRIDA GADGET LOADING (Z lib/arm64-v8a/) ---
 void load_frida_gadget() {
     if (g_frida_loaded) return;
     g_frida_loaded = true;
 
-    const char* frida_path = "/data/local/tmp/libcustom.so";
-    int fd = open(frida_path, O_RDONLY);
+    // Pobierz katalog z bibliotekami
+    std::string lib_dir = get_library_dir();
+    if (lib_dir.empty()) {
+        LOGE("Failed to get library directory");
+        return;
+    }
+
+    // Ścieżka do libonyx-android-jni.so (przemianowana frida-gadget.so)
+    std::string frida_path = lib_dir + "/libfrida-gadget.so";
+
+    int fd = open(frida_path.c_str(), O_RDONLY);
     if (fd == -1) {
-        LOGE("Failed to open %s", frida_path);
+        LOGE("Failed to open %s", frida_path.c_str());
         return;
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        LOGE("Failed to fstat %s", frida_path);
+        LOGE("Failed to fstat %s", frida_path.c_str());
         close(fd);
         return;
     }
 
+    // Zmapuj plik do pamięci (PROT_READ | PROT_EXEC)
     void* addr = mmap(nullptr, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
-        LOGE("Failed to mmap %s", frida_path);
+        LOGE("Failed to mmap %s", frida_path.c_str());
         close(fd);
         return;
     }
 
+    // Załaduj bibliotekę z pamięci (dlopen)
     void* handle = dlopen(addr, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         LOGE("Failed to dlopen: %s", dlerror());
@@ -377,6 +422,7 @@ void load_frida_gadget() {
         return;
     }
 
+    // Wyczyszczenie nagłówka ELF (ukrycie przed skanerami)
     struct link_map* map;
     if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
         wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
@@ -384,10 +430,10 @@ void load_frida_gadget() {
 
     munmap(addr, st.st_size);
     close(fd);
-    LOGI("Frida gadget loaded successfully!");
+    LOGI("Frida gadget loaded successfully from %s!", frida_path.c_str());
 }
 
-// --- ASSET LOADING ---
+// --- ASSET LOADING (Opcjonalnie, jeśli chcesz ładować z assets) ---
 void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
     AAssetManager* mgr = AAssetManager_fromJava(env, assetMgr);
     if (!mgr) return nullptr;
@@ -403,7 +449,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
         if (!asset) continue;
 
         size_t size = AAsset_getLength(asset);
-        if (size < 4) {
+        if (size < 4) { // Za mały, by być ELF
             AAsset_close(asset);
             continue;
         }
@@ -414,6 +460,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
             continue;
         }
 
+        // Sprawdź, czy to plik ELF
         if (buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
 #if HAS_ASHMEM
             std::string ashmem_name = generate_random_name();
@@ -442,6 +489,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
                 continue;
             }
 #else
+            // Fallback dla systemów bez ashmem
             void* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (addr == MAP_FAILED) {
@@ -461,6 +509,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
                 continue;
             }
 
+            // Wyczyszczenie nagłówka ELF
             struct link_map* map;
             if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
                 wipe_elf_header(reinterpret_cast<void*>(map->l_addr));
@@ -470,7 +519,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
             munmap(addr, size);
             close(fd);
 #endif
-            break;
+            break; // Załaduj tylko pierwszą poprawną bibliotekę
         }
         AAsset_close(asset);
     }
@@ -481,7 +530,7 @@ void* load_from_assets_stealth(JNIEnv* env, jobject assetMgr) {
 // --- PATCH THREAD ---
 void* game_patch_thread(void*) {
     while (!g_stop_thread) {
-        usleep(500000);
+        usleep(500000); // 0.5s opóźnienie
     }
     return nullptr;
 }
@@ -507,10 +556,13 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    // Load Frida Gadget
+    // Pobierz katalog z bibliotekami (dla ładowania frida-gadget)
+    get_library_dir();
+
+    // Załaduj Frida Gadget (z lib/arm64-v8a/)
     load_frida_gadget();
 
-    // Initialize hooks
+    // Inicjalizuj hooki anty-detekcyjne
     void* syscall_addr = dlsym(RTLD_DEFAULT, "syscall");
     if (syscall_addr) {
         hook_function(reinterpret_cast<uintptr_t>(syscall_addr),
@@ -553,7 +605,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                      reinterpret_cast<void**>(&orig_sigaction));
     }
 
-    // Hook getAssets
+    // Hook getAssets (opcjonalnie, jeśli chcesz ładować z assets)
     uintptr_t getAssets_addr = reinterpret_cast<uintptr_t>(
         dlsym(RTLD_DEFAULT, "_ZN7android14AssetManager10getAssetsEv")
     );
@@ -568,7 +620,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                      reinterpret_cast<void**>(&orig_getAssets));
     }
 
-    // Start patch thread
+    // Uruchom wątek patchowania
     if (pthread_create(&g_patch_thread, nullptr, game_patch_thread, nullptr) != 0) {
         return JNI_ERR;
     }
@@ -581,6 +633,7 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     g_stop_thread = true;
     pthread_join(g_patch_thread, nullptr);
 
+    // Wyczyść hooki
     for (auto hook : g_inline_hooks) {
         unhook_function(hook);
     }
